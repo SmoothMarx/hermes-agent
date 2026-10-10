@@ -43,6 +43,20 @@ from agent.model_metadata import (
 )
 from agent.redact import redact_sensitive_text
 from agent.turn_context import drop_stale_api_content
+from agent.context_compressor_markers import (
+    SKILL_PRUNED_MARKER_PREFIX,
+    _MAX_PRUNED_SKILL_MARKERS,
+    _PRUNED_SKILLS_SECTION_HEADING,
+    _SKILL_VIEW_PRUNE_MIN_CHARS,
+    _carries_survival_marker,
+    _collect_ghosted_skill_names,
+    _collect_pointer_markers,
+    _extract_pointer_markers,
+    _extract_pruned_skill_names,
+    _reinject_pointer_markers,
+    _reinject_pruned_skill_markers,
+    _skill_pruned_marker,
+)
 from tools.todo_tool import TODO_INJECTION_HEADER
 
 logger = logging.getLogger(__name__)
@@ -857,76 +871,14 @@ def _is_summary_stub(content: str) -> bool:
 # user answer is never re-summarized away on a later prune pass.
 _PRUNE_MIN_CHARS = 200
 
-# Ghost-skill defense: the ONE canonical prune marker; emit sites and presence
-# checks must use the same string so they cannot drift.
-# Ghost-skill defense (#32106): when compaction reduces an old ``skill_view`` result to a 1-line metadata
-# summary, the model still believes the skill is loaded even though its instructions are gone. The marker
-# below is the ONE canonical prune signal — ``_skill_pruned_marker()`` builds it and every presence check
-# matches against the same string, so the emit side and the check side can never drift apart (the original
-# PR #44166 emitted ``[SKILL_PRUNED:`` but presence-checked ``[SKILL_PRUNED]``, making re-injection fire
-# even when the marker had survived).
-SKILL_PRUNED_MARKER_PREFIX = "[SKILL_PRUNED:"
-# Small skill_view results stay verbatim; shared by emit site and summarizer scan.
-_SKILL_VIEW_PRUNE_MIN_CHARS = 5000
-# Bounds the re-injected "## Pruned Skills" block; newest-referenced win.
-_MAX_PRUNED_SKILL_MARKERS = 20
-
-
-def _skill_pruned_marker(skill_name: str) -> str:
-    """Return the canonical prune marker for *skill_name* (shared by emit and check sites)."""
-    return (
-        f"{SKILL_PRUNED_MARKER_PREFIX} content lost in compression; "
-        f"reload with skill_view(name='{skill_name}')]"
-    )
-
-
-# Anchored on the shared prefix so marker wording changes stay in sync.
-_SKILL_PRUNED_MARKER_RE = re.compile(
-    re.escape(SKILL_PRUNED_MARKER_PREFIX) + r"[^\]]*?reload with skill_view\(name='([^']+)'\)",
-)
-
-
-def _extract_pruned_skill_names(text: str) -> list[str]:
-    """Return skill names referenced by prune markers in *text*, in order."""
-    return list(dict.fromkeys(m.group(1) for m in _SKILL_PRUNED_MARKER_RE.finditer(text or "")))
-
-
-def _collect_ghosted_skill_names(turns: list[dict[str, Any]]) -> list[str]:
-    """Skill names about to be lost in compaction: demoted ``skill_view`` rows and raw, never-demoted bodies."""
-    call_id_to_skill: dict[str, str] = {}
-    for idx, skill in _skill_view_call_sites(turns):
-        for tc in turns[idx].get("tool_calls") or []:
-            cid = _tc_get(tc, "id")
-            if cid and _tc_get(_tc_get(tc, "function", {}), "name") == "skill_view":
-                call_id_to_skill[cid] = skill
-    names: list[str] = []
-    for msg in turns:
-        content = msg.get("content")
-        names += _extract_pruned_skill_names(_content_text_for_contains(content))
-        if msg.get("role") == "tool" and isinstance(content, str) and len(content) > _SKILL_VIEW_PRUNE_MIN_CHARS:
-            names.append(call_id_to_skill.get(str(msg.get("tool_call_id") or ""), ""))
-    return [name for name in dict.fromkeys(names) if name]
-
-
-_PRUNED_SKILLS_SECTION_HEADING = "## Pruned Skills"
-
-
-def _reinject_pruned_skill_markers(summary: str, skill_names: list[str]) -> str:
-    """Deterministically restore prune markers the summarizer dropped.
-    Presence is checked against the canonical marker string; the appended block is plain body text (no
-    handoff prefix/scaffolding) and is redacted like all others."""
-    missing = [_skill_pruned_marker(name) for name in skill_names if _skill_pruned_marker(name) not in summary]
-    if not missing:
-        return summary
-    block = (
-        "\n\n" + _PRUNED_SKILLS_SECTION_HEADING + "\n"
-        + "\n".join(missing)
-        + "\n(The listed skills' instructions were pruned during context "
-        "compression. Reload with the skill_view call in each marker before "
-        "relying on that skill; one reload per skill is enough — ignore any "
-        "older markers for the same skill.)"
-    )
-    return summary + _redact_compaction_text(block)
+# Marker survival lives in ``agent/context_compressor_markers`` (imported at the top of this
+# module and re-exported so existing import sites keep working). Two families: ``[SKILL_PRUNED:``
+# for pruned skills (#32106) and declared pointer markers such as ``[APROPOS-PIN …]``.
+#
+# Why a module and not a prompt clause: the summarizer is asked to repeat these tokens verbatim,
+# but a paraphrase that keeps the story and drops the token raises nothing and is silent. Both
+# families are therefore restored DETERMINISTICALLY — collected from the raw turn list before the
+# summarizer call, re-appended after it if what came back no longer carries them.
 
 
 # Lean tail mode: small recency window; continuity via verbatim user messages in
@@ -3664,15 +3616,17 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         # path.
         _pruned_names = _collect_ghosted_skill_names(turns_to_summarize)
         del _pruned_names[_MAX_PRUNED_SKILL_MARKERS:]
+        _preserved_pointers = _collect_pointer_markers(turns_to_summarize)
         summary = self._with_summary_prefix(_redact_compaction_text(body.strip()))
         summary = elide(summary, _FALLBACK_SUMMARY_MAX_CHARS)
         # Re-inject AFTER the size cap: markers live at the end, where truncation cuts.
         summary = _reinject_pruned_skill_markers(summary, _pruned_names)
+        summary = _reinject_pointer_markers(summary, _preserved_pointers)
         return self._augment_summary_lean(summary, turns_to_summarize)
 
     def _demote_stale_tail_tools(self, messages: list[dict[str, Any]], tail_start: int) -> list[dict[str, Any]]:
         """Lean mode: demote tail tool results older than the newest ``_LEAN_TAIL_KEEP_TOOL_ROUNDS`` rounds to
-        recovery stubs; skill-marker rows untouched. New list (untouched rows shared, demoted copied)."""
+        recovery stubs; rows carrying a survival marker untouched. New list (untouched rows shared, demoted copied)."""
         session_id = getattr(self, "_session_id", "") or ""
         rounds_seen = 0
         protected: set[int] = set()
@@ -3690,7 +3644,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             content = msg.get("content")
             if msg.get("role") != "tool" or i in protected or not isinstance(content, str):
                 continue
-            if len(content) < _LEAN_TAIL_DEMOTE_MIN_CHARS or SKILL_PRUNED_MARKER_PREFIX in content or _is_summary_stub(content):
+            if len(content) < _LEAN_TAIL_DEMOTE_MIN_CHARS or _carries_survival_marker(content) or _is_summary_stub(content):
                 continue
             result[i] = _rewritten(msg, _lean_recovery_stub(msg.get("tool_name") or "", len(content), session_id))
             demoted += 1
@@ -4021,6 +3975,12 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         _pruned_skill_names = list(dict.fromkeys(
             _collect_ghosted_skill_names(turns_to_summarize) + _extract_pruned_skill_names(self._previous_summary or "")
         ))[:_MAX_PRUNED_SKILL_MARKERS]
+        # Same treatment for declared pointer markers: the session id inside one is an argument the
+        # summarizer cannot re-derive, and a carried summary is re-summarized on every later fork,
+        # so the previous summary is scanned too — that is where the chain loses the id.
+        _preserved_pointers = list(dict.fromkeys(
+            _collect_pointer_markers(turns_to_summarize) + _extract_pointer_markers(self._previous_summary or "")
+        ))
         # Lean mode even-samples oversized input (one bounded request, never a second).
         if getattr(self, "tail_mode", "lean") == "lean":
             records = self._serialize_records_for_summary(turns_to_summarize)
@@ -4042,6 +4002,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             # Restore any [SKILL_PRUNED] marker the summarizer paraphrased away.
             # See #32106.
             summary = _reinject_pruned_skill_markers(summary, _pruned_skill_names)
+            summary = _reinject_pointer_markers(summary, _preserved_pointers)
             summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
             summary = self._augment_summary_lean(summary, turns_to_summarize)
             self._validate_summary_user_provenance(summary, has_user_turn)
