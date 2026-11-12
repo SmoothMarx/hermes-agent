@@ -1,0 +1,27 @@
+# Perso — Hermes Desktop plugin (community catalog entry).
+#
+# `sha:` is the release: a commit carrying the desktop/ layout, the root
+# plugin.yaml and the desktop/plugin.js this entry describes. A re-pin bumps
+# `sha` and `version` together in a new PR; the image URLs below are pinned to
+# the same sha, so they move with it.
+name: perso
+repo: https://github.com/SmoothMarx/perso
+sha: df52fdbd422ef668a47af951decc182fbeae6583
+description: "Personae's little brother: instead of a roster to expand profile by profile, just the list — every profile's sessions in one stream, ordered by activity, each row carrying its profile's picture and name. Sessions arrive sorted into Unread, Running and Read, and any of them can be grouped by topic. Search, an archived section, colour, a row menu that acts on the whole selection, and Apropos — a new session that already knows the ones you picked, one of them or a whole group — come along. Disclosure — a pane over all your local profiles: it reads their sessions, groups and settings through the app's own requests and, only when you click, creates, opens, deletes or archives sessions (deletes ask first) and files them into groups; Apropos starts a session carrying a hidden pointer message naming those you picked; the toolbar's + creates a real session so the empty chat can introduce the profile; no network calls or telemetry."
+maintainer: SmoothMarx
+tier: community
+category: desktop
+version: "0.1.20"
+# A designed card, not a capture: the list in it is fictional (mira/atlas/quill),
+# so it shows the pane's shape without publishing anyone's sessions. 1600x800,
+# drawn at 2x, the sibling of Personae's cover.
+image: https://raw.githubusercontent.com/SmoothMarx/perso/df52fdbd422ef668a47af951decc182fbeae6583/assets/perso-cover.png
+screenshots:
+  - https://raw.githubusercontent.com/SmoothMarx/perso/df52fdbd422ef668a47af951decc182fbeae6583/assets/perso-cover.png
+platforms: [linux, macos, windows]
+capabilities:
+  provides_tools: []
+  provides_hooks: []
+  provides_middleware: []
+  requires_env: []
+requires_hermes: ">=0.21.6"
